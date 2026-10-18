@@ -95,14 +95,16 @@ class PublicationTests(unittest.TestCase):
                 Path("evidence/build-metadata.json").write_text(json.dumps(metadata))
                 Path("evidence/vulnerabilities.json").write_text('{"Results": []}')
                 assets = [{"name": "build-metadata.json"}, {"name": "vulnerabilities.json"}]
-                replies = [[[]], "", {"draft": True, "assets": assets},
-                           "", {"draft": False, "prerelease": False, "immutable": True,
+                replies = [[[]], "", [[{"id": 42, "tag_name": "v" + VERSION}]],
+                           {"draft": True, "assets": assets}, "", {"draft": False, "prerelease": False, "immutable": True,
                                 "assets": assets, "html_url": "https://example.com/release"}]
                 with patch.object(release, "gh", side_effect=[json.dumps(r) for r in replies]) as gh, \
                         contextlib.redirect_stdout(io.StringIO()):
                     release.main()
                 self.assertIn("--draft", gh.call_args_list[1].args)
-                self.assertIn("--draft=false", gh.call_args_list[3].args)
+                self.assertIn("draft=false", gh.call_args_list[4].args)
+                self.assertIn("repos/example/builder/releases/42", gh.call_args_list[3].args)
+                self.assertFalse(any("/releases/tags/" in str(c.args) for c in gh.call_args_list))
                 self.assertFalse(any("--clobber" in c.args for c in gh.call_args_list))
 
     def test_unlocked_publication_fails_closed(self):
@@ -117,7 +119,8 @@ class PublicationTests(unittest.TestCase):
                 Path("evidence/build-metadata.json").write_text(json.dumps(metadata))
                 Path("evidence/vulnerabilities.json").write_text('{"Results": []}')
                 assets = [{"name": "build-metadata.json"}, {"name": "vulnerabilities.json"}]
-                replies = [[[]], "", {"draft": True, "assets": assets}, "",
+                replies = [[[]], "", [[{"id": 42, "tag_name": "v" + VERSION}]],
+                           {"draft": True, "assets": assets}, "",
                            {"draft": False, "prerelease": False, "immutable": False}]
                 with patch.object(release, "gh", side_effect=[json.dumps(r) for r in replies]) as gh, \
                         self.assertRaisesRegex(SystemExit, "not immutable"):

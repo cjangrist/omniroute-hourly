@@ -60,12 +60,20 @@ overwritten by this workflow; GHCR tags are not server-enforced immutable. Pin i
     files = [str(p) for p in sorted(Path('evidence').iterdir()) if p.is_file()]
     gh('release', 'create', tag, *files, '--repo', repo, '--target', env['GITHUB_SHA'],
        '--title', tag, '--notes-file', 'release-notes.md', '--draft')
-    draft = json.loads(gh('api', f'repos/{repo}/releases/tags/{tag}'))
+    # Drafts may not have a Git tag yet, so the by-tag endpoint returns 404.
+    # Discover the authenticated draft in the release collection and read by ID.
+    pages = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repo}/releases'))
+    matches = [r for page in pages for r in page if r['tag_name'] == tag]
+    if len(matches) != 1:
+        raise SystemExit('Expected exactly one newly created draft release')
+    release_id = matches[0]['id']
+    draft = json.loads(gh('api', f'repos/{repo}/releases/{release_id}'))
     expected = {Path(f).name for f in files}
     if not draft['draft'] or {a['name'] for a in draft['assets']} != expected:
         raise SystemExit('Draft release is missing evidence; refusing publication')
-    gh('release', 'edit', tag, '--repo', repo, '--draft=false', '--latest')
-    published = json.loads(gh('api', f'repos/{repo}/releases/tags/{tag}'))
+    gh('api', '--method', 'PATCH', f'repos/{repo}/releases/{release_id}',
+       '-F', 'draft=false', '-f', 'make_latest=true')
+    published = json.loads(gh('api', f'repos/{repo}/releases/{release_id}'))
     if published['draft'] or published['prerelease'] or not published['immutable']:
         raise SystemExit('Published release is not immutable')
     if {a['name'] for a in published['assets']} != expected:
