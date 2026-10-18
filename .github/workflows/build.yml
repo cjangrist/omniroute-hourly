@@ -19,26 +19,31 @@ permissions:
 
 jobs:
   build:
+    name: Build and inspect (no signing or publishing credentials)
     runs-on: ubuntu-24.04
     timeout-minutes: 350
-    permissions:
-      contents: write
-      packages: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      UPSTREAM: diegosouzapw/OmniRoute
+    outputs:
+      version: ${{ steps.upstream.outputs.version }}
+      image: ${{ steps.upstream.outputs.image }}
+      sha: ${{ steps.upstream.outputs.sha }}
+      branch: ${{ steps.upstream.outputs.branch }}
+      upstream_version: ${{ steps.upstream.outputs.upstream_version }}
+      build_timestamp: ${{ steps.upstream.outputs.build_timestamp }}
     steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
-      - name: Test release naming and publication
+      - name: Test release naming and security policy
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
-
       - name: Resolve current upstream default branch and exact commit
         id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: diegosouzapw/OmniRoute
         run: python3 scripts/resolve-upstream.py
-
       - name: Checkout exact upstream source (without credentials)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -46,11 +51,13 @@ jobs:
           ref: ${{ steps.upstream.outputs.sha }}
           path: upstream
           persist-credentials: false
-
+      - name: Export tracked source and record its identity
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: python3 scripts/source-evidence.py
       - name: Hosted runner build headroom
         run: |
           set -euo pipefail
-          # Public standard Linux runner, no paid large or self-hosted runner.
           free -h
           df -h /
           sudo swapoff -a
@@ -59,22 +66,17 @@ jobs:
           sudo chmod 600 /mnt/omniroute.swap
           sudo mkswap /mnt/omniroute.swap
           sudo swapon /mnt/omniroute.swap
-
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Build using unmodified upstream Dockerfile and npm build scripts
+      - name: Build exact exported upstream source
+        id: image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
-          context: upstream
-          file: upstream/Dockerfile
+          context: build-context
+          file: build-context/Dockerfile
           target: runner-base
           platforms: linux/amd64
           load: true
+          pull: true
           tags: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
           build-args: |
             OMNIROUTE_USE_TURBOPACK=0
@@ -87,48 +89,187 @@ jobs:
             org.opencontainers.image.licenses=MIT
             io.omniroute.upstream.repository=https://github.com/diegosouzapw/OmniRoute
             io.omniroute.upstream.branch=${{ steps.upstream.outputs.branch }}
+            io.omniroute.builder.revision=${{ github.sha }}
           cache-from: type=gha,scope=upstream-amd64
           cache-to: type=gha,scope=upstream-amd64,mode=max,ignore-error=true
-
-      - name: Boot smoke check (not upstream release qualification)
+      - name: Verify build context was not modified
+        run: python3 scripts/source-evidence.py --verify
+      - name: Boot smoke check
         env:
           IMAGE: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
         run: bash scripts/smoke.sh "$IMAGE"
-
-      - name: Publish version image and promote latest
+      - name: Generate SPDX software bill of materials
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          output-file: evidence/sbom.spdx.json
+          format: spdx-json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Scan vulnerabilities (report, not an upstream release gate)
+        uses: aquasecurity/trivy-action@6abccf398f78b4c337599c0656f933d91efb91a0 # pinned
+        with:
+          image-ref: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          scanners: vuln
+          format: json
+          output: evidence/vulnerabilities.json
+          exit-code: '0'
+          timeout: 15m
+      - name: Fail on detected image secrets
+        uses: aquasecurity/trivy-action@6abccf398f78b4c337599c0656f933d91efb91a0 # pinned
+        with:
+          image-ref: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          scanners: secret
+          format: json
+          output: evidence/secrets.json
+          exit-code: '1'
+          timeout: 15m
+      - name: Export tested image and BuildKit metadata
         env:
-          IMAGE: ${{ steps.upstream.outputs.image }}
-          VERSION: ${{ steps.upstream.outputs.version }}
+          IMAGE: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          BUILDKIT_METADATA: ${{ steps.image.outputs.metadata }}
         run: |
           set -euo pipefail
+          printf '%s\n' "$BUILDKIT_METADATA" > evidence/buildkit-metadata.json
+          docker image inspect "$IMAGE" --format '{{.Id}}' > evidence/image-config-digest.txt
+          docker save "$IMAGE" -o image.tar
+          sha256sum image.tar > image.tar.sha256
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: tested-image
+          path: |
+            image.tar
+            image.tar.sha256
+            evidence/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+  publish:
+    name: Sign, attest, verify and lock release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE: ${{ needs.build.outputs.image }}
+      VERSION: ${{ needs.build.outputs.version }}
+      UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
+      UPSTREAM_BRANCH: ${{ needs.build.outputs.branch }}
+      UPSTREAM_VERSION: ${{ needs.build.outputs.upstream_version }}
+      BUILD_TIMESTAMP: ${{ needs.build.outputs.build_timestamp }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: tested-image
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: sigstore/cosign-installer@b9c35392b7c1401bcc77d30c9b07cf4b1c7a7b07 # pinned
+        with:
+          cosign-release: v3.1.3
+      - name: Publish tested image without overwriting an existing version
+        run: |
+          set -euo pipefail
+          sha256sum --check image.tar.sha256
+          docker load -i image.tar
+          test "$(docker image inspect "$IMAGE:$VERSION" --format '{{.Id}}')" = "$(cat evidence/image-config-digest.txt)"
+          # Distinguish a missing tag from network/auth failure using the registry API.
+          python3 scripts/require-new-tag.py
           docker push "$IMAGE:$VERSION"
-          docker buildx imagetools create --prefer-index=false -t "$IMAGE:latest" "$IMAGE:$VERSION"
-          version_digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
-          latest_digest=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
-          test "$version_digest" = "$latest_digest"
-          echo "IMAGE_DIGEST=$version_digest" >> "$GITHUB_ENV"
-
-      - name: Publish matching GitHub release and build metadata
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -er .digest)
+          echo "IMAGE_DIGEST=$digest" >> "$GITHUB_ENV"
+      - name: Prepare source provenance and release evidence
+        run: python3 scripts/prepare-release.py
+      - name: Keyless sign exact image digest (public transparency log)
+        run: cosign sign --yes "$IMAGE@$IMAGE_DIGEST"
+      - name: GitHub build provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest upstream source and build inputs
+        id: source
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          predicate-type: https://github.com/cjangrist/omniroute-hourly/upstream-build/v1
+          predicate-path: evidence/source-provenance.json
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest SPDX SBOM
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          sbom-path: evidence/sbom.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+      - name: Collect and attest release evidence
         env:
-          IMAGE: ${{ steps.upstream.outputs.image }}
-          VERSION: ${{ steps.upstream.outputs.version }}
-          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
-          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
-          UPSTREAM_VERSION: ${{ steps.upstream.outputs.upstream_version }}
-          BUILD_TIMESTAMP: ${{ steps.upstream.outputs.build_timestamp }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SOURCE_BUNDLE: ${{ steps.source.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$PROVENANCE_BUNDLE" evidence/provenance.sigstore.json
+          cp "$SOURCE_BUNDLE" evidence/source.sigstore.json
+          cp "$SBOM_BUNDLE" evidence/sbom.sigstore.json
+          (cd evidence && sha256sum -- ./*.json ./*.txt > SHA256SUMS)
+      - name: Attest checksums for release assets
+        id: checksums
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: evidence/SHA256SUMS
+      - name: Verify signatures and provenance before release
+        env:
+          CHECKSUM_BUNDLE: ${{ steps.checksums.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$CHECKSUM_BUNDLE" evidence/checksums.sigstore.json
+          bash scripts/verify.sh "$IMAGE@$IMAGE_DIGEST" "$GITHUB_SHA"
+          (cd evidence && sha256sum --check SHA256SUMS)
+      - name: Publish immutable release (assets first, then lock)
         run: python3 scripts/release.py
-
-      - name: Build summary
-        if: always()
-        env:
-          RESULT: ${{ job.status }}
-          VERSION: ${{ steps.upstream.outputs.version }}
-          SHA: ${{ steps.upstream.outputs.sha }}
+      - name: Verify GitHub release attestation
+        run: gh release verify "v$VERSION" --repo "$GITHUB_REPOSITORY"
+      - name: Promote verified release to latest
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --prefer-index=false -t "$IMAGE:latest" "$IMAGE@$IMAGE_DIGEST"
+          latest=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -er .digest)
+          test "$latest" = "$IMAGE_DIGEST"
+      - name: Verified supply-chain summary
         run: |
           {
-            echo "## Hourly upstream image: $RESULT"
-            echo "Version: $VERSION"
-            echo "Upstream commit: $SHA"
-            echo "Digest: ${IMAGE_DIGEST:-not published}"
-            echo "No upstream release-green, lint, unit/integration, or scanner gates are imported."
+            echo '## Verified publication'
+            echo '- [x] Exact upstream Git snapshot and unchanged build context'
+            echo '- [x] Isolated build without publishing/signing permissions'
+            echo '- [x] Container boot/health check and image secret scan'
+            echo '- [x] Vulnerability report (findings disclosed, not a zero-CVE claim)'
+            echo '- [x] SPDX SBOM and signed SBOM attestation'
+            echo '- [x] Keyless image signature and public transparency log'
+            echo '- [x] GitHub build and upstream-source attestations verified'
+            echo '- [x] Checksummed/attested assets and immutable release verified'
+            echo '- [x] latest digest matches the verified release'
+            echo "Digest: $IMAGE_DIGEST"
           } >> "$GITHUB_STEP_SUMMARY"

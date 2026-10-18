@@ -1,71 +1,77 @@
 #!/usr/bin/env python3
-"""Publish a release per timestamped build, preserving exact upstream provenance."""
-import datetime
+"""Upload complete evidence to a draft, publish once, then require immutability."""
 import json
 import os
-import pathlib
+from pathlib import Path
 import subprocess
 
 
 def gh(*args):
-    return subprocess.check_output(["gh", *args], text=True)
+    return subprocess.check_output(['gh', *args], text=True)
 
 
 def main():
     env = os.environ
-    repo, version = env["GITHUB_REPOSITORY"], env["VERSION"]
-    tag = f"v{version}"
-    run = f"https://github.com/{repo}/actions/runs/{env['GITHUB_RUN_ID']}"
-    metadata = {
-        "upstream_repository": "diegosouzapw/OmniRoute",
-        "upstream_branch": env["UPSTREAM_BRANCH"],
-        "upstream_commit": env["UPSTREAM_SHA"],
-        "upstream_version": env["UPSTREAM_VERSION"],
-        "version": version,
-        "build_timestamp": int(env["BUILD_TIMESTAMP"]),
-        "image": f"{env['IMAGE']}:{version}",
-        "latest": f"{env['IMAGE']}:latest",
-        "digest": env["IMAGE_DIGEST"],
-        "platform": "linux/amd64",
-        "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "workflow_run": run,
-        "automation_commit": env["GITHUB_SHA"],
-    }
-    pathlib.Path("build-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    notes = f"""## Unofficial upstream snapshot: {version}
+    repo, version = env['GITHUB_REPOSITORY'], env['VERSION']
+    tag = 'v' + version
+    metadata = json.loads(Path('evidence/build-metadata.json').read_text())
+    if metadata['automation_commit'] != env['GITHUB_SHA'] or metadata['version'] != version:
+        raise SystemExit('Release metadata does not match this workflow')
+    settings = json.loads(gh('api', f'repos/{repo}/immutable-releases'))
+    if not settings['enabled']:
+        raise SystemExit('Immutable releases must be enabled before publishing')
+    pages = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repo}/releases'))
+    if any(r['tag_name'] == tag for page in pages for r in page):
+        raise SystemExit('Release already exists; immutable releases are never overwritten')
+    scans = json.loads(Path('evidence/vulnerabilities.json').read_text())
+    counts = {}
+    for result in scans.get('Results', []):
+        for finding in result.get('Vulnerabilities', []):
+            severity = finding['Severity']
+            counts[severity] = counts.get(severity, 0) + 1
+    notes = f'''## Verified upstream snapshot: {version}
 
-Built from [{env['UPSTREAM_BRANCH']} @ {env['UPSTREAM_SHA']}](https://github.com/diegosouzapw/OmniRoute/commit/{env['UPSTREAM_SHA']}).
+- [x] Exact upstream source: `{metadata['upstream_commit']}`
+- [x] Automation revision: `{metadata['automation_commit']}`
+- [x] Isolated build and container boot/health check
+- [x] Image secret scan passed
+- [x] Keyless image signature; GitHub OIDC identity and public Sigstore log
+- [x] Verified GitHub build provenance, upstream-source attestation and SPDX SBOM attestation
+- [x] Checksummed release evidence with signed checksum attestation
+- [x] Immutable release policy enabled (locked on publication)
 
-- Upstream package version: `{env['UPSTREAM_VERSION']}`
-- Unix build timestamp: `{env['BUILD_TIMESTAMP']}`
-- Image: `{env['IMAGE']}:{version}`
-- Moving channel: `{env['IMAGE']}:latest`
-- Digest: `{env['IMAGE_DIGEST']}`
-- Platform: `linux/amd64`
-- [Successful build and container boot smoke check]({run})
+Image: `{env['IMAGE']}@{metadata['digest']}`
 
-Uses the upstream Dockerfile (`runner-base`) and its build scripts unchanged.
-This is **not an official or release-qualified upstream release**. Upstream release-green,
-lint, unit/integration and vulnerability gates are intentionally not prerequisites.
-GitHub tag identifies this builder's automation revision; the upstream source is the SHA above.
-Every build gets a timestamped release, even when upstream source is unchanged.
-Retrying publication for the same resolved build refreshes its release and metadata.
-"""
-    pathlib.Path("release-notes.md").write_text(notes)
-    releases = json.loads(gh("api", "--paginate", "--slurp", f"repos/{repo}/releases"))
-    exists = any(r["tag_name"] == tag for page in releases for r in page)
-    if exists:
-        gh("release", "edit", tag, "--repo", repo, "--title", tag,
-           "--notes-file", "release-notes.md", "--latest")
-    else:
-        gh("release", "create", tag, "--repo", repo, "--target", env["GITHUB_SHA"],
-           "--title", tag, "--notes-file", "release-notes.md", "--latest")
-    gh("release", "upload", tag, "build-metadata.json", "--repo", repo, "--clobber")
-    release = json.loads(gh("api", f"repos/{repo}/releases/tags/{tag}"))
-    assert not release["draft"] and not release["prerelease"]
-    assert any(a["name"] == "build-metadata.json" for a in release["assets"])
-    print(release["html_url"])
+[Build and verification]({metadata['workflow_run']}) · [Verification instructions](https://github.com/{repo}/blob/{env['GITHUB_SHA']}/SECURITY.md)
+
+### Vulnerability disclosure
+Scan findings by severity: `{json.dumps(counts, sort_keys=True)}`.
+The complete report is attached. This is not a zero-vulnerability certification.
+
+### Trust boundary
+Source and builder revisions are distinct and both are attested. The original upstream Dockerfile
+and build scripts are used. Network-fetched dependencies and base images are not hermetic;
+no independent reproducible-build or SLSA level certification is claimed. Signatures authenticate
+the builder and artifact digest, not the safety of upstream code. Version image tags are not
+overwritten by this workflow; GHCR tags are not server-enforced immutable. Pin image digests.
+'''
+    Path('release-notes.md').write_text(notes)
+    # Upload every asset while draft; publication locks assets and the release tag.
+    files = [str(p) for p in sorted(Path('evidence').iterdir()) if p.is_file()]
+    gh('release', 'create', tag, *files, '--repo', repo, '--target', env['GITHUB_SHA'],
+       '--title', tag, '--notes-file', 'release-notes.md', '--draft')
+    draft = json.loads(gh('api', f'repos/{repo}/releases/tags/{tag}'))
+    expected = {Path(f).name for f in files}
+    if not draft['draft'] or {a['name'] for a in draft['assets']} != expected:
+        raise SystemExit('Draft release is missing evidence; refusing publication')
+    gh('release', 'edit', tag, '--repo', repo, '--draft=false', '--latest')
+    published = json.loads(gh('api', f'repos/{repo}/releases/tags/{tag}'))
+    if published['draft'] or published['prerelease'] or not published['immutable']:
+        raise SystemExit('Published release is not immutable')
+    if {a['name'] for a in published['assets']} != expected:
+        raise SystemExit('Published release assets do not match')
+    print(published['html_url'])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

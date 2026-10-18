@@ -83,45 +83,52 @@ class NamingTests(unittest.TestCase):
 
 
 class PublicationTests(unittest.TestCase):
-    def check_publication(self, exists):
+    def test_draft_assets_then_publish_and_require_lock(self):
         env = {"GITHUB_REPOSITORY": "example/builder", "VERSION": VERSION,
-               "GITHUB_RUN_ID": "123", "UPSTREAM_BRANCH": "release/v3.8.52",
-               "UPSTREAM_SHA": SHA, "UPSTREAM_VERSION": "3.8.52",
-               "BUILD_TIMESTAMP": str(TIMESTAMP), "IMAGE": "ghcr.io/example/builder",
-               "IMAGE_DIGEST": "sha256:" + "a" * 64, "GITHUB_SHA": "b" * 40}
-        tag = "v" + VERSION
-        published = {"draft": False, "prerelease": False,
-                     "assets": [{"name": "build-metadata.json"}],
-                     "html_url": "https://example.com/release"}
-        pages = [[], [{"tag_name": tag}]] if exists else [[]]
+               "IMAGE": "ghcr.io/example/builder", "GITHUB_SHA": "b" * 40}
+        metadata = {"version": VERSION, "automation_commit": "b" * 40,
+                    "upstream_commit": SHA, "digest": "sha256:" + "a" * 64,
+                    "workflow_run": "https://example.com/build"}
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
-            with contextlib.chdir(tmp), patch.dict(os.environ, env), \
-                    patch.object(release, "gh", side_effect=[json.dumps(pages), "", "", json.dumps(published)]) as gh, \
-                    contextlib.redirect_stdout(io.StringIO()):
-                release.main()
-                metadata = json.loads(Path("build-metadata.json").read_text())
-                notes = Path("release-notes.md").read_text()
-        self.assertEqual(metadata["version"], VERSION)
-        self.assertEqual(metadata["build_timestamp"], TIMESTAMP)
-        self.assertEqual(metadata["upstream_commit"], SHA)
-        self.assertEqual(metadata["image"], env["IMAGE"] + ":" + VERSION)
-        self.assertEqual(metadata["digest"], env["IMAGE_DIGEST"])
-        self.assertIn(str(TIMESTAMP), notes)
-        command = gh.call_args_list[1].args
-        self.assertEqual(command[:3], ("release", "edit" if exists else "create", tag))
-        self.assertIn("--latest", command)
-        if not exists:
-            self.assertEqual(command[command.index("--target") + 1], env["GITHUB_SHA"])
-        self.assertEqual(gh.call_args_list[2].args[:4],
-                         ("release", "upload", tag, "build-metadata.json"))
-        self.assertEqual(gh.call_args_list[3].args,
-                         ("api", f"repos/example/builder/releases/tags/{tag}"))
+            with contextlib.chdir(tmp), patch.dict(os.environ, env):
+                Path("evidence").mkdir()
+                Path("evidence/build-metadata.json").write_text(json.dumps(metadata))
+                Path("evidence/vulnerabilities.json").write_text('{"Results": []}')
+                assets = [{"name": "build-metadata.json"}, {"name": "vulnerabilities.json"}]
+                replies = [{"enabled": True}, [[]], "", {"draft": True, "assets": assets},
+                           "", {"draft": False, "prerelease": False, "immutable": True,
+                                "assets": assets, "html_url": "https://example.com/release"}]
+                with patch.object(release, "gh", side_effect=[json.dumps(r) for r in replies]) as gh, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    release.main()
+                self.assertIn("--draft", gh.call_args_list[2].args)
+                self.assertIn("--draft=false", gh.call_args_list[4].args)
+                self.assertFalse(any("--clobber" in c.args for c in gh.call_args_list))
 
-    def test_create_timestamped_release(self):
-        self.check_publication(False)
+    def test_disabled_immutability_fails_closed(self):
+        env = {"GITHUB_REPOSITORY": "example/builder", "VERSION": VERSION, "GITHUB_SHA": "b" * 40}
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            with contextlib.chdir(tmp), patch.dict(os.environ, env):
+                Path("evidence").mkdir()
+                Path("evidence/build-metadata.json").write_text(json.dumps(
+                    {"version": VERSION, "automation_commit": "b" * 40}))
+                with patch.object(release, "gh", return_value='{"enabled": false}') as gh, \
+                        self.assertRaises(SystemExit):
+                    release.main()
+                gh.assert_called_once()
 
-    def test_retry_refreshes_exact_timestamped_release(self):
-        self.check_publication(True)
+    def test_existing_release_cannot_be_overwritten(self):
+        env = {"GITHUB_REPOSITORY": "example/builder", "VERSION": VERSION, "GITHUB_SHA": "b" * 40}
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            with contextlib.chdir(tmp), patch.dict(os.environ, env):
+                Path("evidence").mkdir()
+                Path("evidence/build-metadata.json").write_text(json.dumps(
+                    {"version": VERSION, "automation_commit": "b" * 40}))
+                with patch.object(release, "gh", side_effect=[
+                        '{"enabled": true}', json.dumps([[{"tag_name": "v" + VERSION}]])]) as gh, \
+                        self.assertRaises(SystemExit):
+                    release.main()
+                self.assertEqual(gh.call_count, 2)
 
 
 if __name__ == "__main__":

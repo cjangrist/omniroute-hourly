@@ -2,3 +2,7 @@ __pycache__/
 build-metadata.json
 release-notes.md
 upstream/
+build-context/
+evidence/
+image.tar
+image.tar.sha256

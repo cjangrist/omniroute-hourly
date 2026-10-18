@@ -2,6 +2,7 @@
 
 [![Latest build attempt](https://github.com/cjangrist/omniroute-hourly/actions/workflows/build.yml/badge.svg)](https://github.com/cjangrist/omniroute-hourly/actions/workflows/build.yml)
 [![Published release](https://img.shields.io/github/v/release/cjangrist/omniroute-hourly?label=published%20snapshot&sort=date)](https://github.com/cjangrist/omniroute-hourly/releases/latest)
+[![Supply-chain verification](https://img.shields.io/badge/supply_chain-verifiable-blue?logo=sigstore)](SECURITY.md)
 [![Public GHCR image](https://img.shields.io/badge/GHCR-public%20image-blue?logo=docker)](https://github.com/cjangrist/omniroute-hourly/pkgs/container/omniroute-hourly)
 
 Unofficial, automated builds of the **current default branch** of
@@ -40,11 +41,12 @@ port and volume layout are preserved. **Platform: Linux amd64.**
 - Every successful build publishes a matching GitHub release containing
   upstream branch, full SHA, image digest, Unix build timestamp and workflow link
   in `build-metadata.json`. Rebuilding the same source gets a new timestamped
-  release; retrying publication for the same resolved build refreshes that release.
+  release. Published releases and assets are immutable; existing versions are never overwritten.
 - Release naming and publication regression tests run before each build. Run
   locally with `python3 -m unittest discover -s scripts -p 'test_*.py' -v`.
 - `:latest` always points to the newest successfully built and boot-checked image;
-  failures leave the previous working `:latest` in place. Serialized publishing
+  promotion happens only after signing, provenance verification and immutable-release publication.
+  Earlier failures leave the previous `:latest` in place. Serialized publishing
   prevents overlapping jobs from racing the tag.
 - **Latest build attempt** badge is green/red for the latest workflow result.
   **Published snapshot** separately identifies the most recent successful release.
@@ -55,7 +57,7 @@ port and volume layout are preserved. **Platform: Linux amd64.**
 Checks out an exact upstream SHA, then builds its **unmodified `Dockerfile`,
 `runner-base` target**, which runs upstream `npm ci`, native-dependency checks,
 `npm run build` and standalone assembly. Matches upstream's webpack build arguments
-(`OMNIROUTE_USE_TURBOPACK=0`, 12288 MB V8 heap, one page-data worker).
+(`OMNIROUTE_USE_TURBOPACK=0`, 12288 MB V8 heap, two build workers).
 Uses standard **GitHub-hosted `ubuntu-24.04` public/free runners**, with swap for
 build headroom. No self-hosted or paid larger runners, Docker Hub credentials,
 or long-lived publishing tokens. Publication uses the repository's `GITHUB_TOKEN`.
@@ -63,8 +65,10 @@ or long-lived publishing tokens. Publication uses the repository's `GITHUB_TOKEN
 Does **not** import upstream release-green, lint, policy, unit/integration,
 mutation, release-acceptance, semver-promotion or vulnerability-scan gates.
 See [upstream issue #15306](https://github.com/diegosouzapw/OmniRoute/issues/15306)
-for the release-cadence problem this bypasses. The only additional runtime check
-is a bounded container boot and upstream `/healthz` probe before publishing.
+for the release-cadence problem this bypasses. A bounded container boot and
+upstream `/healthz` probe, image secret scan, signatures, attestations and immutable
+release verification must pass. Vulnerability findings are disclosed in the attached
+report rather than recreating upstream release gating. See [security guarantees and verification](SECURITY.md).
 Actual Docker compilation/native checks still have to succeed; no errors are hidden.
 
 This is an **unofficial rolling snapshot**, potentially containing upstream bugs
