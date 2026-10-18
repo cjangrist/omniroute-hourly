@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a release per source version/SHA, refreshing evidence on hourly rebuilds."""
+"""Publish a release per timestamped build, preserving exact upstream provenance."""
 import datetime
 import json
 import os
@@ -22,6 +22,7 @@ def main():
         "upstream_commit": env["UPSTREAM_SHA"],
         "upstream_version": env["UPSTREAM_VERSION"],
         "version": version,
+        "build_timestamp": int(env["BUILD_TIMESTAMP"]),
         "image": f"{env['IMAGE']}:{version}",
         "latest": f"{env['IMAGE']}:latest",
         "digest": env["IMAGE_DIGEST"],
@@ -36,6 +37,7 @@ def main():
 Built from [{env['UPSTREAM_BRANCH']} @ {env['UPSTREAM_SHA']}](https://github.com/diegosouzapw/OmniRoute/commit/{env['UPSTREAM_SHA']}).
 
 - Upstream package version: `{env['UPSTREAM_VERSION']}`
+- Unix build timestamp: `{env['BUILD_TIMESTAMP']}`
 - Image: `{env['IMAGE']}:{version}`
 - Moving channel: `{env['IMAGE']}:latest`
 - Digest: `{env['IMAGE_DIGEST']}`
@@ -46,7 +48,8 @@ Uses the upstream Dockerfile (`runner-base`) and its build scripts unchanged.
 This is **not an official or release-qualified upstream release**. Upstream release-green,
 lint, unit/integration and vulnerability gates are intentionally not prerequisites.
 GitHub tag identifies this builder's automation revision; the upstream source is the SHA above.
-Rebuilds of an unchanged source refresh this release and its metadata rather than duplicate it.
+Every build gets a timestamped release, even when upstream source is unchanged.
+Retrying publication for the same resolved build refreshes its release and metadata.
 """
     pathlib.Path("release-notes.md").write_text(notes)
     releases = json.loads(gh("api", "--paginate", "--slurp", f"repos/{repo}/releases"))

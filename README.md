@@ -30,11 +30,19 @@ port and volume layout are preserved. **Platform: Linux amd64.**
   GitHub schedules are best-effort and can be delayed. GitHub may disable scheduled
   workflows after 60 days of repository inactivity; re-enable from Actions if needed.
 - Rebuilds every run, even if upstream source is unchanged, using BuildKit layer caching.
-- Uses the upstream `package.json` version plus a **12-character commit hash**:
-  image `3.8.52-0123456789ab`, release `v3.8.52-0123456789ab` (format examples only).
-- Every successful build publishes/refreshes a matching GitHub release containing
-  upstream branch, full SHA, image digest, build timestamp and workflow link in
-  `build-metadata.json`. Same source/version reuses the same release.
+- Uses the upstream `package.json` version, a **10-digit Unix build timestamp**
+  (UTC seconds since the epoch), then a **12-character upstream commit hash**:
+  image `3.8.52-1792155103-0123456789ab`, release
+  `v3.8.52-1792155103-0123456789ab` (format examples only). The timestamp is
+  captured once when resolving the build, so names sort chronologically within
+  the same upstream version, independently of hash order. Alphabetical ordering
+  across different upstream versions is not semantic-version ordering.
+- Every successful build publishes a matching GitHub release containing
+  upstream branch, full SHA, image digest, Unix build timestamp and workflow link
+  in `build-metadata.json`. Rebuilding the same source gets a new timestamped
+  release; retrying publication for the same resolved build refreshes that release.
+- Release naming and publication regression tests run before each build. Run
+  locally with `python3 -m unittest discover -s scripts -p 'test_*.py' -v`.
 - `:latest` always points to the newest successfully built and boot-checked image;
   failures leave the previous working `:latest` in place. Serialized publishing
   prevents overlapping jobs from racing the tag.

@@ -32,6 +32,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test release naming and publication
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
       - name: Resolve current upstream default branch and exact commit
         id: upstream
         run: python3 scripts/resolve-upstream.py
@@ -112,6 +115,7 @@ jobs:
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
           UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
           UPSTREAM_VERSION: ${{ steps.upstream.outputs.upstream_version }}
+          BUILD_TIMESTAMP: ${{ steps.upstream.outputs.build_timestamp }}
         run: python3 scripts/release.py
 
       - name: Build summary
