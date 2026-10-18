@@ -17,9 +17,9 @@ def main():
     metadata = json.loads(Path('evidence/build-metadata.json').read_text())
     if metadata['automation_commit'] != env['GITHUB_SHA'] or metadata['version'] != version:
         raise SystemExit('Release metadata does not match this workflow')
-    settings = json.loads(gh('api', f'repos/{repo}/immutable-releases'))
-    if not settings['enabled']:
-        raise SystemExit('Immutable releases must be enabled before publishing')
+    # The settings endpoint requires repository administration, which the
+    # deliberately least-privileged GITHUB_TOKEN does not have. Enforce the
+    # actual published release's immutable state below instead.
     pages = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repo}/releases'))
     if any(r['tag_name'] == tag for page in pages for r in page):
         raise SystemExit('Release already exists; immutable releases are never overwritten')
@@ -38,7 +38,7 @@ def main():
 - [x] Keyless image signature; GitHub OIDC identity and public Sigstore log
 - [x] Verified GitHub build provenance, upstream-source attestation and SPDX SBOM attestation
 - [x] Checksummed release evidence with signed checksum attestation
-- [x] Immutable release policy enabled (locked on publication)
+- [x] Immutable release required (verified after publication before latest promotion)
 
 Image: `{env['IMAGE']}@{metadata['digest']}`
 

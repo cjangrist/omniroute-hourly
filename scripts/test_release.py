@@ -95,27 +95,34 @@ class PublicationTests(unittest.TestCase):
                 Path("evidence/build-metadata.json").write_text(json.dumps(metadata))
                 Path("evidence/vulnerabilities.json").write_text('{"Results": []}')
                 assets = [{"name": "build-metadata.json"}, {"name": "vulnerabilities.json"}]
-                replies = [{"enabled": True}, [[]], "", {"draft": True, "assets": assets},
+                replies = [[[]], "", {"draft": True, "assets": assets},
                            "", {"draft": False, "prerelease": False, "immutable": True,
                                 "assets": assets, "html_url": "https://example.com/release"}]
                 with patch.object(release, "gh", side_effect=[json.dumps(r) for r in replies]) as gh, \
                         contextlib.redirect_stdout(io.StringIO()):
                     release.main()
-                self.assertIn("--draft", gh.call_args_list[2].args)
-                self.assertIn("--draft=false", gh.call_args_list[4].args)
+                self.assertIn("--draft", gh.call_args_list[1].args)
+                self.assertIn("--draft=false", gh.call_args_list[3].args)
                 self.assertFalse(any("--clobber" in c.args for c in gh.call_args_list))
 
-    def test_disabled_immutability_fails_closed(self):
-        env = {"GITHUB_REPOSITORY": "example/builder", "VERSION": VERSION, "GITHUB_SHA": "b" * 40}
+    def test_unlocked_publication_fails_closed(self):
+        env = {"GITHUB_REPOSITORY": "example/builder", "VERSION": VERSION,
+               "IMAGE": "ghcr.io/example/builder", "GITHUB_SHA": "b" * 40}
+        metadata = {"version": VERSION, "automation_commit": "b" * 40,
+                    "upstream_commit": SHA, "digest": "sha256:" + "a" * 64,
+                    "workflow_run": "https://example.com/build"}
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
             with contextlib.chdir(tmp), patch.dict(os.environ, env):
                 Path("evidence").mkdir()
-                Path("evidence/build-metadata.json").write_text(json.dumps(
-                    {"version": VERSION, "automation_commit": "b" * 40}))
-                with patch.object(release, "gh", return_value='{"enabled": false}') as gh, \
-                        self.assertRaises(SystemExit):
+                Path("evidence/build-metadata.json").write_text(json.dumps(metadata))
+                Path("evidence/vulnerabilities.json").write_text('{"Results": []}')
+                assets = [{"name": "build-metadata.json"}, {"name": "vulnerabilities.json"}]
+                replies = [[[]], "", {"draft": True, "assets": assets}, "",
+                           {"draft": False, "prerelease": False, "immutable": False}]
+                with patch.object(release, "gh", side_effect=[json.dumps(r) for r in replies]) as gh, \
+                        self.assertRaisesRegex(SystemExit, "not immutable"):
                     release.main()
-                gh.assert_called_once()
+                self.assertFalse(any("immutable-releases" in str(c.args) for c in gh.call_args_list))
 
     def test_existing_release_cannot_be_overwritten(self):
         env = {"GITHUB_REPOSITORY": "example/builder", "VERSION": VERSION, "GITHUB_SHA": "b" * 40}
@@ -125,10 +132,10 @@ class PublicationTests(unittest.TestCase):
                 Path("evidence/build-metadata.json").write_text(json.dumps(
                     {"version": VERSION, "automation_commit": "b" * 40}))
                 with patch.object(release, "gh", side_effect=[
-                        '{"enabled": true}', json.dumps([[{"tag_name": "v" + VERSION}]])]) as gh, \
+                        json.dumps([[{"tag_name": "v" + VERSION}]])]) as gh, \
                         self.assertRaises(SystemExit):
                     release.main()
-                self.assertEqual(gh.call_count, 2)
+                self.assertEqual(gh.call_count, 1)
 
 
 if __name__ == "__main__":
