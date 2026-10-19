@@ -30,7 +30,11 @@ port and volume layout are preserved. **Platform: Linux amd64.**
 - Runs every hour at minute **17 UTC**, on builder changes, and manually from Actions.
   GitHub schedules are best-effort and can be delayed. GitHub may disable scheduled
   workflows after 60 days of repository inactivity; re-enable from Actions if needed.
-- Rebuilds every run, even if upstream source is unchanged, using BuildKit layer caching.
+- Checks upstream each run; builds only when the exact upstream commit differs from
+  the last successfully published snapshot. No change is a green successful check:
+  Docker builds, signing and release publication are skipped without changing `latest`.
+  Failed/incomplete publications are retried on the next check. Builder changes
+  and manual runs use the same new-source rule, not a forced rebuild.
 - Uses the upstream `package.json` version, a **10-digit Unix build timestamp**
   (UTC seconds since the epoch), then a **12-character upstream commit hash**:
   image `3.8.52-1792155103-0123456789ab`, release
@@ -40,8 +44,8 @@ port and volume layout are preserved. **Platform: Linux amd64.**
   across different upstream versions is not semantic-version ordering.
 - Every successful build publishes a matching GitHub release containing
   upstream branch, full SHA, image digest, Unix build timestamp and workflow link
-  in `build-metadata.json`. Rebuilding the same source gets a new timestamped
-  release. Published releases and assets are immutable; existing versions are never overwritten.
+  in `build-metadata.json`. A new upstream commit gets a timestamped release.
+  Published releases and assets are immutable; existing versions are never overwritten.
 - Release naming and publication regression tests run before each build. Run
   locally with `python3 -m unittest discover -s scripts -p 'test_*.py' -v`.
 - `:latest` always points to the newest successfully built and boot-checked image;

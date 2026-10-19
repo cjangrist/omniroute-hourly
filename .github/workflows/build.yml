@@ -18,11 +18,12 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build and inspect (no signing or publishing credentials)
+  check:
+    name: Check for a new upstream commit
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 5
     outputs:
+      build: ${{ steps.decision.outputs.build }}
       version: ${{ steps.upstream.outputs.version }}
       image: ${{ steps.upstream.outputs.image }}
       sha: ${{ steps.upstream.outputs.sha }}
@@ -30,30 +31,56 @@ jobs:
       upstream_version: ${{ steps.upstream.outputs.upstream_version }}
       build_timestamp: ${{ steps.upstream.outputs.build_timestamp }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Test release naming and security policy
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Resolve exact upstream snapshot once
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: diegosouzapw/OmniRoute
+        run: |
+          GITHUB_OUTPUT="$RUNNER_TEMP/resolved-output" python3 scripts/resolve-upstream.py
+          cat "$RUNNER_TEMP/resolved-output" >> "$GITHUB_OUTPUT"
+      - name: Compare with last successful publication
+        id: decision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESOLVED_OUTPUT: ${{ runner.temp }}/resolved-output
+        run: python3 scripts/check-upstream.py
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    name: Build and inspect (no signing or publishing credentials)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    outputs:
+      version: ${{ needs.check.outputs.version }}
+      image: ${{ needs.check.outputs.image }}
+      sha: ${{ needs.check.outputs.sha }}
+      branch: ${{ needs.check.outputs.branch }}
+      upstream_version: ${{ needs.check.outputs.upstream_version }}
+      build_timestamp: ${{ needs.check.outputs.build_timestamp }}
+    steps:
       - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2
         with:
           egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Test release naming and security policy
-        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
-      - name: Resolve current upstream default branch and exact commit
-        id: upstream
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPSTREAM: diegosouzapw/OmniRoute
-        run: python3 scripts/resolve-upstream.py
       - name: Checkout exact upstream source (without credentials)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: diegosouzapw/OmniRoute
-          ref: ${{ steps.upstream.outputs.sha }}
+          ref: ${{ needs.check.outputs.sha }}
           path: upstream
           persist-credentials: false
       - name: Export tracked source and record its identity
         env:
-          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.sha }}
         run: python3 scripts/source-evidence.py
       - name: Hosted runner build headroom
         run: |
@@ -77,18 +104,18 @@ jobs:
           platforms: linux/amd64
           load: true
           pull: true
-          tags: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          tags: ${{ needs.check.outputs.image }}:${{ needs.check.outputs.version }}
           build-args: |
             OMNIROUTE_USE_TURBOPACK=0
             OMNIROUTE_BUILD_MEMORY_MB=12288
             OMNIROUTE_BUILD_WORKERS=2
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
-            org.opencontainers.image.version=${{ steps.upstream.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.check.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
             org.opencontainers.image.licenses=MIT
             io.omniroute.upstream.repository=https://github.com/diegosouzapw/OmniRoute
-            io.omniroute.upstream.branch=${{ steps.upstream.outputs.branch }}
+            io.omniroute.upstream.branch=${{ needs.check.outputs.branch }}
             io.omniroute.builder.revision=${{ github.sha }}
           cache-from: type=gha,scope=upstream-amd64
           cache-to: type=gha,scope=upstream-amd64,mode=max,ignore-error=true
@@ -96,12 +123,12 @@ jobs:
         run: python3 scripts/source-evidence.py --verify
       - name: Boot smoke check
         env:
-          IMAGE: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          IMAGE: ${{ needs.check.outputs.image }}:${{ needs.check.outputs.version }}
         run: bash scripts/smoke.sh "$IMAGE"
       - name: Generate SPDX software bill of materials
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
-          image: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          image: ${{ needs.check.outputs.image }}:${{ needs.check.outputs.version }}
           output-file: evidence/sbom.spdx.json
           format: spdx-json
           upload-artifact: false
@@ -109,7 +136,7 @@ jobs:
       - name: Scan vulnerabilities (report, not an upstream release gate)
         uses: aquasecurity/trivy-action@6abccf398f78b4c337599c0656f933d91efb91a0 # pinned
         with:
-          image-ref: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          image-ref: ${{ needs.check.outputs.image }}:${{ needs.check.outputs.version }}
           scanners: vuln
           format: json
           output: evidence/vulnerabilities.json
@@ -118,7 +145,7 @@ jobs:
       - name: Fail on detected image secrets
         uses: aquasecurity/trivy-action@6abccf398f78b4c337599c0656f933d91efb91a0 # pinned
         with:
-          image-ref: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          image-ref: ${{ needs.check.outputs.image }}:${{ needs.check.outputs.version }}
           scanners: secret
           format: json
           output: evidence/secrets.json
@@ -126,7 +153,7 @@ jobs:
           timeout: 15m
       - name: Export tested image and BuildKit metadata
         env:
-          IMAGE: ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.version }}
+          IMAGE: ${{ needs.check.outputs.image }}:${{ needs.check.outputs.version }}
           BUILDKIT_METADATA: ${{ steps.image.outputs.metadata }}
         run: |
           set -euo pipefail
