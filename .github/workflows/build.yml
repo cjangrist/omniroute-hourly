@@ -87,12 +87,14 @@ jobs:
           set -euo pipefail
           free -h
           df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo swapoff -a
           sudo rm -f /swapfile /mnt/swapfile
           sudo fallocate -l 8G /mnt/omniroute.swap
           sudo chmod 600 /mnt/omniroute.swap
           sudo mkswap /mnt/omniroute.swap
           sudo swapon /mnt/omniroute.swap
+          df -h /
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Build exact exported upstream source
         id: image
@@ -278,7 +280,17 @@ jobs:
       - name: Publish immutable release (assets first, then lock)
         run: python3 scripts/release.py
       - name: Verify GitHub release attestation
-        run: gh release verify "v$VERSION" --repo "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 12); do
+            if gh release verify "v$VERSION" --repo "$GITHUB_REPOSITORY"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 12 ]; then
+              exit 1
+            fi
+            sleep 5
+          done
       - name: Promote verified release to latest
         run: |
           set -euo pipefail
